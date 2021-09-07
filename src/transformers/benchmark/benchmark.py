@@ -161,14 +161,19 @@ class PyTorchBenchmark(Benchmark):
         if self.args.torchscript:
             raise NotImplementedError("Training for torchscript is currently not implemented")
         else:
-            train_model = model
+            # train_model = model
+            from .model_wrapper import ModelSerializer
+            train_model = ModelSerializer(
+                model,
+                f"{model_name}_{'xla' if self.args.is_tpu else 'native'}.pickle"
+            )
 
         model.train()
         model.to(self.args.device)
         from transformers import AdamW
         optimizer = AdamW(model.parameters(), lr=5e-5)
         if self.args.fp16:
-            if is_torch_tpu_available():
+            if self.args.is_tpu:
                 from torch_xla.amp import autocast, GradScaler
             else:
                 from torch.cuda.amp import autocast, GradScaler
@@ -184,7 +189,7 @@ class PyTorchBenchmark(Benchmark):
                 with autocast():
                     loss = train_model(input_ids, labels=input_ids)[0]
                 scaler.scale(loss).backward()
-                if is_torch_tpu_available():
+                if self.args.is_tpu:
                     gradients = xm._fetch_gradients(optimizer)
                     xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
                 scaler.step(optimizer)
@@ -193,7 +198,7 @@ class PyTorchBenchmark(Benchmark):
             else:
                 loss = train_model(input_ids, labels=input_ids)[0]
                 loss.backward()
-                if is_torch_tpu_available():
+                if self.args.is_tpu:
                     xm.optimizer_step(optimizer)
                     xm.mark_step()
                 else:
@@ -206,7 +211,7 @@ class PyTorchBenchmark(Benchmark):
                 with autocast():
                     loss = train_model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
                 scaler.scale(loss).backward()
-                if is_torch_tpu_available():
+                if self.args.is_tpu:
                     gradients = xm._fetch_gradients(optimizer)
                     xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
                 scaler.step(optimizer)
@@ -215,7 +220,7 @@ class PyTorchBenchmark(Benchmark):
             else:
                 loss = train_model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
                 loss.backward()
-                if is_torch_tpu_available():
+                if self.args.is_tpu:
                     xm.optimizer_step(optimizer)
                     xm.mark_step()
                 else:
