@@ -17,7 +17,8 @@
     Benchmarking the library on inference and training in PyTorch.
 """
 
-
+import csv
+import os 
 import timeit
 from typing import Callable, Optional
 
@@ -72,7 +73,11 @@ class PyTorchBenchmark(Benchmark):
 
     def _train_speed(self, model_name: str, batch_size: int, sequence_length: int) -> float:
         _train = self._prepare_train_func(model_name, batch_size, sequence_length)
-        return self._measure_speed(_train)
+        measure_speed_func = self._measure_speed(_train)
+        print("Writing...")
+        self.write_loss_to_csv(f"/home/ubuntu/hopper/test/pt_acc/{model_name}_{sequence_length}_{batch_size}_native.csv")
+        # import sys;sys.exit()
+        return measure_speed_func
 
     def _train_memory(
         self, model_name: str, batch_size: int, sequence_length: int
@@ -137,8 +142,13 @@ class PyTorchBenchmark(Benchmark):
         _forward = encoder_decoder_forward if config.is_encoder_decoder else encoder_forward
         return _forward
 
+    def write_loss_to_csv(self, csv_file_name): 
+        with open(csv_file_name, 'w') as myfile: 
+            wr = csv.writer(myfile, quoting=csv.QUOTE_ALL)
+            wr.writerow(self.loss_list)
+        
     def _prepare_train_func(self, model_name: str, batch_size: int, sequence_length: int) -> Callable[[], None]:
-        torch.manual_seed(0)
+        torch.random.manual_seed(42)
         config = self.config_dict[model_name]
 
         has_model_class_in_config = (
@@ -163,6 +173,7 @@ class PyTorchBenchmark(Benchmark):
             raise NotImplementedError("Training for torchscript is currently not implemented")
         else:
             if self.args.dump_loss:
+                print("Dumping loss")
                 from .model_wrapper import ModelSerializer
                 train_model = ModelSerializer(
                     model,
@@ -184,52 +195,109 @@ class PyTorchBenchmark(Benchmark):
 
         # encoder-decoder has vocab size saved differently
         vocab_size = config.vocab_size if hasattr(config, "vocab_size") else config.encoder.vocab_size
-        input_ids = torch.randint(vocab_size, (batch_size, sequence_length), dtype=torch.long, device=self.args.device)
+        loader = None 
+        self.loss_list = []
+        loader = torch.load(f'/home/ubuntu/hopper/test/loader_{batch_size}.pt')
+        log_loss = True
 
-        def compute_loss_and_backprob_encoder():
-            optimizer.zero_grad()
-            if self.args.fp16:
-                with autocast():
+        if not loader:
+            input_ids = torch.randint(vocab_size, (batch_size, sequence_length), dtype=torch.long, device=self.args.device)
+            def compute_loss_and_backprob_encoder():
+                optimizer.zero_grad()
+                if self.args.fp16:
+                    with autocast():
+                        loss = train_model(input_ids, labels=input_ids)[0]
+                    scaler.scale(loss).backward()
+                    if self.args.is_tpu:
+                        gradients = xm._fetch_gradients(optimizer)
+                        xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                    scaler.step(optimizer)
+                    scaler.update()
+                    return loss
+                else:
                     loss = train_model(input_ids, labels=input_ids)[0]
-                scaler.scale(loss).backward()
-                if self.args.is_tpu:
-                    gradients = xm._fetch_gradients(optimizer)
-                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                scaler.step(optimizer)
-                scaler.update()
-                return loss
-            else:
-                loss = train_model(input_ids, labels=input_ids)[0]
-                loss.backward()
-                if self.args.is_tpu:
-                    xm.optimizer_step(optimizer)
-                    xm.mark_step()
-                else:
-                    optimizer.step()
-                return loss
+                    loss.backward()
+                    if self.args.is_tpu:
+                        xm.optimizer_step(optimizer)
+                        xm.mark_step()
+                    else:
+                        optimizer.step()
+                    return loss
 
-        def compute_loss_and_backprob_encoder_decoder():
-            optimizer.zero_grad()
-            if self.args.fp16:
-                with autocast():
+            def compute_loss_and_backprob_encoder_decoder():
+                optimizer.zero_grad()
+                if self.args.fp16:
+                    with autocast():
+                        loss = train_model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
+                    scaler.scale(loss).backward()
+                    if self.args.is_tpu:
+                        gradients = xm._fetch_gradients(optimizer)
+                        xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                    scaler.step(optimizer)
+                    scaler.update()
+                    return loss
+                else:
                     loss = train_model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
-                scaler.scale(loss).backward()
-                if self.args.is_tpu:
-                    gradients = xm._fetch_gradients(optimizer)
-                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                scaler.step(optimizer)
-                scaler.update()
-                return loss
-            else:
-                loss = train_model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
-                loss.backward()
-                if self.args.is_tpu:
-                    xm.optimizer_step(optimizer)
-                    xm.mark_step()
-                else:
-                    optimizer.step()
-                return loss
-
+                    loss.backward()
+                    if self.args.is_tpu:
+                        xm.optimizer_step(optimizer)
+                        xm.mark_step()
+                    else:
+                        optimizer.step()
+                    return loss
+        else:
+            def compute_loss_and_backprob_encoder():
+                for step, batch in enumerate(loader):
+                    self.step = step + 1
+                    optimizer.zero_grad()
+                    input_ids = batch['input_ids'].to(self.args.device)
+                    labels = batch['labels'].to(self.args.device)
+                    if self.args.fp16:
+                        with autocast():
+                            # loss = train_model(input_ids, labels=input_ids)[0]
+                            loss = train_model(input_ids, labels=labels)[0]
+                        scaler.scale(loss).backward()
+                        if self.args.is_tpu:
+                            gradients = xm._fetch_gradients(optimizer)
+                            xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # loss = train_model(input_ids, labels=input_ids)[0]
+                        loss = train_model(input_ids, labels=labels)[0]
+                        loss.backward()
+                        if self.args.is_tpu:
+                            xm.optimizer_step(optimizer)
+                            xm.mark_step()
+                        else:
+                            optimizer.step()
+                    if log_loss:
+                        self.loss_list.append(loss.item())
+            def compute_loss_and_backprob_encoder_decoder():
+                for step, batch in enumerate(loader): 
+                    self.step = step + 1 
+                    optimizer.zero_grad()
+                    input_ids = batch['input_ids'].to(self.args.device)
+                    labels = batch['labels'].to(self.args.device) 
+                    if self.args.fp16:
+                        with autocast():
+                            loss = train_model(input_ids, decoder_input_ids=input_ids, labels=labels)[0]
+                        scaler.scale(loss).backward()
+                        if self.args.is_tpu:
+                            gradients = xm._fetch_gradients(optimizer)
+                            xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss = train_model(input_ids, decoder_input_ids=input_ids, labels=labels)[0]
+                        loss.backward()
+                        if self.args.is_tpu:
+                            xm.optimizer_step(optimizer)
+                            xm.mark_step()
+                        else:
+                            optimizer.step()
+                    if log_loss:
+                        self.loss_list.append(loss.item())
         _train = (
             compute_loss_and_backprob_encoder_decoder
             if config.is_encoder_decoder
@@ -245,22 +313,28 @@ class PyTorchBenchmark(Benchmark):
                 timeit.repeat(
                     func,
                     repeat=1,
-                    number=5,
+                    number=1,
                 )
 
             # as written in https://docs.python.org/2/library/timeit.html#timeit.Timer.repeat, min should be taken rather than the average
+            # runtimes = timeit.repeat(
+            #     func,
+            #     repeat=self.args.repeat,
+            #     number=10,
+            # )
+            print("YOLO",flush=True)
             runtimes = timeit.repeat(
                 func,
-                repeat=self.args.repeat,
-                number=10,
+                repeat=1,
+                number=2,
             )
-
             if self.args.is_tpu and self.args.torch_xla_tpu_print_metrics:
                 import torch_xla.debug.metrics as met
 
                 self.print_fn(met.metrics_report())
+            # return min(runtimes) / 10.0
 
-            return min(runtimes) / 10.0
+            return min(runtimes) / (self.step * 2)
         except RuntimeError as e:
             self.print_fn(f"Doesn't fit on GPU. {e}")
             return "N/A"
